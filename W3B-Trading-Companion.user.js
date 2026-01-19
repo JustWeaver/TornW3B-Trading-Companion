@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TornW3B Trading Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.01
+// @version      2.02
 // @description  Calculates the total value of items in a trade on Torn.com.
 // @match        https://www.torn.com/*
 // @grant        GM_setValue
