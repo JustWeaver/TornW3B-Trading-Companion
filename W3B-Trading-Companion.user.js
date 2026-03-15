@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         TornW3B Trading Companion
 // @namespace    http://tampermonkey.net/
-// @version      2.03
+// @version      2.04
 // @description  Calculates the total value of items in a trade on Torn.com.
 // @match        https://www.torn.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @grant        GM_setClipboard
 // @connect      weav3r.dev
 // @connect      api.torn.com
 // @connect      www.torn.com
@@ -520,40 +521,19 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
 
     const copyToClipboard = async (text) => {
         try {
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                await navigator.clipboard.writeText(text);
-                return true;
-            }
+            GM_setClipboard(text);
+            return true;
         } catch (e) {
-            console.log('Clipboard API failed, using fallback');
-        }
-
-        try {
-            const textarea = document.createElement('textarea');
-            textarea.value = text;
-            textarea.style.position = 'fixed';
-            textarea.style.left = '-999999px';
-            textarea.style.top = '-999999px';
-            document.body.appendChild(textarea);
-            textarea.focus();
-            textarea.select();
-            const success = document.execCommand('copy');
-            document.body.removeChild(textarea);
-            return success;
-        } catch (e) {
-            console.error('Copy failed:', e);
             return false;
         }
     };
 
     const readFromClipboard = async () => {
         try {
-            if (navigator.clipboard && navigator.clipboard.readText) {
+            if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
                 return await navigator.clipboard.readText();
             }
-        } catch (e) {
-            console.log('Clipboard read failed');
-        }
+        } catch (e) {}
         return '';
     };
 
@@ -727,10 +707,13 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
     let timeRefreshInterval = null;
     let isFirstPoll = true;
     let lastPollTime = 0;
+    let isPollingTrades = false;
+    let isStartingTradePolling = false;
     let apiTradeData = {};
     let currentReceipt = null;
     let currentReceiptURL = null;
     let currentTradeMessage = null;
+    const pendingTradeRows = new Set();
 
     const initTradeData = () => ({
         items: [],
@@ -814,9 +797,13 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
         return (await storage.get([key]))[key] || null;
     };
 
-    const storeData = async (tradeID, items, receipt, receiptURL, message = null) => {
+    const storeData = async (tradeID, items, receipt, receiptURL, message = null, manualPrices) => {
         const existing = await getStoredData(tradeID);
-        const manual_prices = existing?.manual_prices || {};
+        const manual_prices = manualPrices === null
+            ? {}
+            : manualPrices
+                ? { ...(existing?.manual_prices || {}), ...manualPrices }
+                : (existing?.manual_prices || {});
         await storage.set({
             [storageKeys.trade(tradeID)]: { items, receipt, receiptURL, message, timestamp: Date.now(), total_value: receipt.total_value, manual_prices }
         });
@@ -1201,12 +1188,18 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
         return match ? match[1] : null;
     };
 
+    const findTradeListItems = (tradeID) =>
+        Array.from(qa(SELECTORS.TRADE_LIST_ITEM)).filter(li => getTradeIDFromElement(li) === String(tradeID));
+
+    const dedupeTradeListItems = (tradeID) => {
+        const matches = findTradeListItems(tradeID);
+        if (matches.length <= 1) return matches[0] || null;
+        matches.slice(1).forEach(li => li.remove());
+        return matches[0];
+    };
+
     const findTradeListItem = (tradeID) => {
-        for (const li of qa(SELECTORS.TRADE_LIST_ITEM)) {
-            const linkTradeID = getTradeIDFromElement(li);
-            if (linkTradeID === String(tradeID)) return li;
-        }
-        return null;
+        return dedupeTradeListItems(tradeID);
     };
 
     const ensureTradeData = (tradeID) => {
@@ -1274,54 +1267,71 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
     const createTradeRow = async (tradeID, userID, description, timestamp) => {
         if (!isTradePage) return;
 
+        const tradeKey = String(tradeID);
+        if (findTradeListItem(tradeKey) || pendingTradeRows.has(tradeKey)) return;
+        pendingTradeRows.add(tradeKey);
+
         const tradeList = getTradeList();
-        if (!tradeList) return;
+        if (!tradeList) {
+            pendingTradeRows.delete(tradeKey);
+            return;
+        }
 
-        const profile = await fetchUserProfile(userID);
-        const userName = profile?.name || `User [${userID}]`;
-        const honor = profile?.honor || 0;
-        const timeRemaining = calculateTimeRemaining(timestamp);
-        const userNameChars = userName.split('').map(c => `<span data-char="${c}"></span>`).join('');
-        const honorImageBase = `/images/honors/${honor}/`;
+        try {
+            if (findTradeListItem(tradeKey)) return;
 
-        const li = el('li');
-        li.innerHTML = `
-            <div class="namet t-blue h">
-                <a class="user name t-hide" data-placeholder="${userName} [${userID}]" href="/profiles.php?XID=${userID}" title="${userName} [${userID}]">
-                    <div class="honor-text-wrap default" style="--arrow-width: 20px;">
-                        <img srcset="${honorImageBase}f.png 1x, ${honorImageBase}f@2x.png 2x, ${honorImageBase}f@3x.png 3x, ${honorImageBase}f@4x.png 4x" src="${honorImageBase}f.png" border="0" alt="${userName} [${userID}]">
-                        <span class="honor-text honor-text-svg">${userNameChars}</span>
-                        <span class="honor-text">${userName}</span>
-                    </div>
-                </a>
-                <a class="user name t-show" data-placeholder="${userName} [${userID}]" href="/profiles.php?XID=${userID}" title="${userName} [${userID}]">
-                    <div class="honor-text-wrap default" style="--arrow-width: 20px;">
-                        <img srcset="${honorImageBase}h.png 1x, ${honorImageBase}h@2x.png 2x, ${honorImageBase}h@3x.png 3x, ${honorImageBase}h@4x.png 4x" src="${honorImageBase}h.png" border="0" alt="${userName} [${userID}]">
-                        <span class="honor-text honor-text-svg">${userNameChars}</span>
-                        <span class="honor-text">${userName}</span>
-                    </div>
-                </a>
-            </div>
-            <div class="desc">
-                <span class="desk">Expires in -</span>
-                <span class="mob">Exp:</span>
-                <span class="time">${timeRemaining} </span>
-                <p>Description: ${description}</p>
-            </div>
-            <div class="view">
-                <a href="trade.php#step=view&ID=${tradeID}" area-label="view">
-                    <i class="view-icon"></i>
-                </a>
-            </div>
-        `;
+            const profile = await fetchUserProfile(userID);
+            const userName = profile?.name || `User [${userID}]`;
+            const honor = profile?.honor || 0;
+            const timeRemaining = calculateTimeRemaining(timestamp);
+            const userNameChars = userName.split('').map(c => `<span data-char="${c}"></span>`).join('');
+            const honorImageBase = `/images/honors/${honor}/`;
 
-        const lastLi = tradeList.querySelector('li.last');
-        if (lastLi) lastLi.classList.remove('last');
+            if (findTradeListItem(tradeKey)) return;
 
-        tradeList.appendChild(li);
-        li.classList.add('last');
-        await updateIndicator(li, tradeID);
-        li.classList.add('flash-new');
+            const li = el('li', {
+                attributes: { 'data-trade-id': tradeKey }
+            });
+            li.innerHTML = `
+                <div class="namet t-blue h">
+                    <a class="user name t-hide" data-placeholder="${userName} [${userID}]" href="/profiles.php?XID=${userID}" title="${userName} [${userID}]">
+                        <div class="honor-text-wrap default" style="--arrow-width: 20px;">
+                            <img srcset="${honorImageBase}f.png 1x, ${honorImageBase}f@2x.png 2x, ${honorImageBase}f@3x.png 3x, ${honorImageBase}f@4x.png 4x" src="${honorImageBase}f.png" border="0" alt="${userName} [${userID}]">
+                            <span class="honor-text honor-text-svg">${userNameChars}</span>
+                            <span class="honor-text">${userName}</span>
+                        </div>
+                    </a>
+                    <a class="user name t-show" data-placeholder="${userName} [${userID}]" href="/profiles.php?XID=${userID}" title="${userName} [${userID}]">
+                        <div class="honor-text-wrap default" style="--arrow-width: 20px;">
+                            <img srcset="${honorImageBase}h.png 1x, ${honorImageBase}h@2x.png 2x, ${honorImageBase}h@3x.png 3x, ${honorImageBase}h@4x.png 4x" src="${honorImageBase}h.png" border="0" alt="${userName} [${userID}]">
+                            <span class="honor-text honor-text-svg">${userNameChars}</span>
+                            <span class="honor-text">${userName}</span>
+                        </div>
+                    </a>
+                </div>
+                <div class="desc">
+                    <span class="desk">Expires in -</span>
+                    <span class="mob">Exp:</span>
+                    <span class="time">${timeRemaining} </span>
+                    <p>Description: ${description}</p>
+                </div>
+                <div class="view">
+                    <a href="trade.php#step=view&ID=${tradeID}" area-label="view">
+                        <i class="view-icon"></i>
+                    </a>
+                </div>
+            `;
+
+            const lastLi = tradeList.querySelector('li.last');
+            if (lastLi) lastLi.classList.remove('last');
+
+            tradeList.appendChild(li);
+            li.classList.add('last');
+            await updateIndicator(li, tradeID);
+            li.classList.add('flash-new');
+        } finally {
+            pendingTradeRows.delete(tradeKey);
+        }
     };
 
 
@@ -1378,6 +1388,8 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
             descDiv.style.padding = '0';
             descDiv.style.margin = '0';
             descDiv.style.overflow = 'hidden';
+
+            li.querySelectorAll('.completed-actions').forEach(actions => actions.remove());
 
             const actionsDiv = el('div', { classes: 'completed-actions' });
 
@@ -1597,14 +1609,15 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
     const pollTradeEvents = async () => {
         const now = Date.now();
         if (now - lastPollTime < CONFIG.POLL_BUFFER) return;
+        if (isPollingTrades) return;
         lastPollTime = now;
-
-        const key = await apiKey.get();
-        if (!key) return;
-
-        const tenMinutesAgo = Math.floor((Date.now() - 600000) / 1000);
+        isPollingTrades = true;
 
         try {
+            const key = await apiKey.get();
+            if (!key) return;
+
+            const tenMinutesAgo = Math.floor((Date.now() - 600000) / 1000);
             const apiUrl = `${CONFIG.TORN_API}user/?key=${key}&cat=94&from=${tenMinutesAgo}&comment=W3B-Script&selections=log`;
             const response = await fetch(apiUrl);
             const httpError = handleHttpError(response.status);
@@ -1626,23 +1639,31 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
             }
         } catch {
             return;
+        } finally {
+            isPollingTrades = false;
         }
     };
 
     const startTradePolling = async () => {
-        if (tradePollingInterval) return;
+        if (tradePollingInterval || isStartingTradePolling) return;
+        isStartingTradePolling = true;
 
-        const key = await apiKey.get();
-        if (!key) return;
+        try {
+            const key = await apiKey.get();
+            if (!key) return;
 
-        isFirstPoll = true;
-        await pollTradeEvents();
-        tradePollingInterval = setInterval(pollTradeEvents, CONFIG.POLL_INTERVAL);
+            isFirstPoll = true;
+            await pollTradeEvents();
+            if (!tradePollingInterval) {
+                tradePollingInterval = setInterval(pollTradeEvents, CONFIG.POLL_INTERVAL);
+            }
 
-        if (!timeRefreshInterval) {
-            timeRefreshInterval = setInterval(refreshTradeStatusTimes, 1000);
+            if (!timeRefreshInterval) {
+                timeRefreshInterval = setInterval(refreshTradeStatusTimes, 1000);
+            }
+        } finally {
+            isStartingTradePolling = false;
         }
-
     };
 
     const stopTradePolling = () => {
@@ -1911,7 +1932,7 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
             currentReceipt = res.receipt;
             currentReceiptURL = res.receiptURL;
             currentTradeMessage = res.message || null;
-            storeData(tradeID, items, res.receipt, res.receiptURL, res.message);
+            storeData(tradeID, items, res.receipt, res.receiptURL, res.message, null);
             updateUI();
             requestAnimationFrame(() => colorCodeItemsByValue());
         }
@@ -2070,21 +2091,22 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
             });
         } else {
             const tradeID = getTradeID();
-
-            if (currentReceipt?.items) {
-                const priceMap = new Map(updatedItems.map(item => [item.itemId, item.price]));
-
-                currentReceipt.items = currentReceipt.items.map(item => {
-                    const itemId = item.id || item.itemId;
-                    if (priceMap.has(itemId)) {
-                        const newPrice = priceMap.get(itemId);
-                        return { ...item, priceUsed: newPrice, totalValue: newPrice * (item.quantity || 1) };
-                    }
-                    return item;
-                });
-
-                currentReceipt.total_value = currentReceipt.items.reduce((sum, item) => sum + (item.totalValue || 0), 0);
+            const responseData = res?.data && typeof res.data === 'object' ? res.data : res;
+            if (responseData?.receipt) {
+                currentReceipt = {
+                    ...currentReceipt,
+                    ...responseData.receipt,
+                    items: currentReceipt?.items?.map(item => {
+                        const updated = responseData.receipt.items?.find(updatedItem =>
+                            String(updatedItem.itemId || updatedItem.id || updatedItem.name) ===
+                            String(item.itemId || item.id || item.name)
+                        );
+                        return updated ? { ...item, ...updated } : item;
+                    }) || responseData.receipt.items || []
+                };
             }
+            currentReceiptURL = responseData?.receiptURL || currentReceiptURL;
+            currentTradeMessage = responseData?.message ?? currentTradeMessage;
 
             if (tradeID) {
                 const items = Array.from(table.querySelectorAll('tbody tr')).map(row => ({
@@ -2092,43 +2114,13 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
                     quantity: parseInt(row.cells[2].textContent)
                 }));
 
-                const existing = await getStoredData(tradeID) || {};
-                existing.items = items;
-                existing.receipt = currentReceipt;
-                existing.receiptURL = existing.receiptURL || currentReceiptURL;
-                existing.total_value = currentReceipt?.total_value || 0;
-                existing.timestamp = Date.now();
-                existing.manual_prices = { ...existing.manual_prices, ...manualPrices };
-
-                await storage.set({ [storageKeys.trade(tradeID)]: existing });
-            }
-
-            const tbody = table.querySelector('tbody');
-            if (tbody && currentReceipt?.items) {
-                tbody.innerHTML = '';
-                currentReceipt.items.forEach(item => {
-                    const isEdited = manualPrices.hasOwnProperty(item.name);
-                    const itemId = item.id || item.itemId || '';
-                    const imageUrl = itemId ? `https://www.torn.com/images/items/${itemId}/medium.png` : '';
-
-                    const row = el('tr', {
-                        children: [
-                            el('td', { children: [el('img', { attributes: { src: imageUrl, alt: 'Item' }, classes: 'item-image' })] }),
-                            el('td', { text: item.name }),
-                            el('td', { text: (item.quantity || 0).toLocaleString() }),
-                            el('td', { text: `$${(item.priceUsed || 0).toLocaleString()}`, classes: isEdited ? ['price-edited'] : [] }),
-                            el('td', { text: `$${(item.totalValue || 0).toLocaleString()}` })
-                        ]
-                    });
-                    row.dataset.itemId = itemId;
-                    tbody.appendChild(row);
-                });
-                makeEditable(table, saveBtn);
+                await storeData(tradeID, items, currentReceipt, currentReceiptURL, currentTradeMessage, manualPrices);
             }
 
             const total = q('.total-value-container');
             if (total) total.textContent = `Total Value: $${currentReceipt.total_value.toLocaleString()}`;
             updateAcceptBtn();
+            if (q('.receipt-modal-overlay.visible')) await showModal();
 
             saveBtn.classList.add('saved');
             await sleep(2000);
@@ -2223,7 +2215,7 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
 
     const initApiKeyButton = async (retryCount = 0) => {
         if (!isMainTradePage()) return;
-        if (retryCount > 20) return;
+        if (retryCount > 300) return;
 
         if (q('.api-key-button')) return;
 
@@ -2514,7 +2506,7 @@ body.dark-mode .msg.right-round button.api-key-button,body.dark-mode .title-blac
                     stripe.classList.add('expanded');
                     updateAcceptBtn(accept);
                     requestAnimationFrame(() => colorCodeItemsByValue());
-                    storeData(tradeID, items, res.receipt, res.receiptURL, res.message);
+                    storeData(tradeID, items, res.receipt, res.receiptURL, res.message, null);
 
                     const unpricedItems = getUnpricedItems(res.receipt);
                     if (unpricedItems.length > 0) {
